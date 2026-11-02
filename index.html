@@ -48,6 +48,17 @@ input[type=range]{width:100%;accent-color:var(--accent)}
 #status{color:var(--muted);font-size:.78rem;margin-top:.3rem}
 #mix{margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.8rem}
 #mix label{display:block;margin-top:.3rem;color:var(--muted)}
+#voiceBox{margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.8rem}
+#voiceBox label{display:block;color:var(--muted);margin:.3rem 0 .25rem}
+#voiceBox .seg{display:flex;gap:.3rem}
+#voiceBox .seg button{flex:1;padding:.35rem .5rem;font-size:.8rem}
+#voiceBox .seg button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink);border-color:transparent}
+#voiceBox .row{margin-top:.35rem}
+#voiceBox input:not([type]){padding:.35rem .5rem;font-size:.78rem;border-radius:8px}
+#voiceBox .row button{padding:.35rem .7rem;font-size:.8rem}
+.btnlink{display:block;margin-top:.4rem;text-align:center;padding:.45rem .8rem;border-radius:999px;background:#5865f2;color:#fff;font-weight:600;text-decoration:none}
+.btnlink:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+#people{max-height:calc(100vh - 140px);overflow:auto}
 #invite{margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.8rem}
 #invite label{display:block;color:var(--muted);margin-bottom:.25rem}
 #invite input{padding:.35rem .5rem;font-size:.78rem;border-radius:8px}
@@ -131,7 +142,15 @@ input[type=range]{width:100%;accent-color:var(--accent)}
   <div id="mix">
     <label for="musicVol">Âm lượng nhạc</label><input type="range" id="musicVol" min="0" max="100" value="80">
     <label for="voiceVol">Âm lượng giọng hát</label><input type="range" id="voiceVol" min="0" max="100" value="100">
-    <label style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="monitor" style="width:auto;margin:0"> Nghe giọng mình (đeo tai nghe)</label>
+    <label id="monitorRow" style="display:flex;gap:.4rem;align-items:center"><input type="checkbox" id="monitor" style="width:auto;margin:0"> Nghe giọng mình (đeo tai nghe)</label>
+  </div>
+  <div id="voiceBox">
+    <label>Giọng hát truyền qua</label>
+    <div class="seg"><button id="vmGame" aria-pressed="true">Trong game</button><button id="vmDiscord" aria-pressed="false">Discord</button></div>
+    <div id="discordRow" class="row" style="display:none"><input id="discordUrl" placeholder="Link mời kênh thoại Discord"><button id="discordSave">Lưu</button></div>
+    <a id="discordJoin" class="btnlink" target="_blank" rel="noopener" style="display:none">Vào kênh thoại Discord</a>
+    <label for="musicDelay">Lùi nhạc cho khớp giọng: <b id="delayVal">350</b> ms</label>
+    <input type="range" id="musicDelay" min="0" max="1500" step="10" value="350">
   </div>
   <div id="invite">
     <label for="inviteUrl">Link mời bạn bè</label>

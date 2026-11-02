@@ -513,7 +513,20 @@ $('#pauseBtn').onclick = () => { if (isSinger()) net.send({ t: now.state === 'pa
 
 /* ================= video YouTube đồng bộ ================= */
 let ytBig = null, ytPrompt = null, musicVol = 80, voiceVol = 1;
-const playTime = () => !now ? 0 : now.state === 'paused' ? (now.pos||0) : Math.max(0, (serverNow()-now.startedAt)/1000);
+// Giờ được đồng bộ theo máy người hát; người nghe phát nhạc lùi lại đúng bằng độ trễ của giọng.
+const clockOff = new Map(), bestRtt = new Map();
+const offsetTo = id => id === uid ? 0 : (clockOff.get(id) || 0);
+let voiceMode = 'game', discordUrl = '';
+const delayKey = () => 'kara.delay.' + voiceMode;
+const defaultDelay = () => voiceMode === 'discord' ? 250 : 350;
+let musicDelay = defaultDelay();
+function loadDelay(){ const v = parseInt(LS.get(delayKey()), 10); musicDelay = Number.isFinite(v) ? clamp(v, 0, 1500) : defaultDelay(); }
+const rawPlayTime = () => {
+  if (!now) return 0;
+  if (now.state === 'paused') return now.pos || 0;
+  return (Date.now() + offsetTo(now.uid) - now.startedAt)/1000 - (now.uid === uid ? 0 : musicDelay/1000);
+};
+const playTime = () => Math.max(0, rawPlayTime());
 function makePlayer(elId, w, h, isBig){
   return new Promise(resolve => {
     const p = new YT.Player(elId, {
@@ -555,7 +568,8 @@ function syncPlayer(p, want){
     return;
   }
   if (st === 0) return;                                 // đã hết bài
-  if (st !== 3 && Math.abs(cur-t) > 1.5) p.seekTo(t, true);
+  if (rawPlayTime() < 0){ if (st === 1) p.pauseVideo(); if (cur > 0.3) p.seekTo(0, true); return; }   // chờ cho khớp độ trễ
+  if (st !== 3 && Math.abs(cur-t) > 0.3 && Date.now() - (p._seekAt || 0) > 6000){ p.seekTo(t + 0.1, true); p._seekAt = Date.now(); }
   if (st !== 1 && st !== 3) p.playVideo();
   if (p === ytBig && st !== 1 && Date.now()-p._started > 4000) $('#unlock').classList.add('on');
 }
@@ -575,18 +589,23 @@ $('#musicVol').oninput = e => { musicVol = +e.target.value; if (ytBig && ytBig.s
 $('#voiceVol').oninput = e => { voiceVol = +e.target.value/100; if (voiceGain) voiceGain.gain.value = voiceVol; if (monGain) monGain.gain.value = voiceVol; };
 
 /* ================= mic: truyền giọng hát qua máy chủ trung chuyển ================= */
-// Mic -> 16 kHz -> nén mu-law 8 bit -> gửi từng đoạn 0,2 giây. Chỉ giọng người đang cầm mic được phát.
-const VRATE = 16000, VCHUNK = 3200;
+// Ưu tiên nén Opus 64 kbps (như Discord), gói 60 ms. Trình duyệt cũ dùng mu-law 16 kHz.
+// Mỗi gói: 'o' hoặc 'm' + mã người gửi (12 ký tự) + dữ liệu base64. Chỉ giọng người đang cầm mic được phát.
+const VRATE = 16000, VCHUNK = 1600;
 let actx = null, voiceGain = null, monSrc = null, monGain = null, nextPlay = 0;
 let localStream = null, holding = false, pendingMic = null, pendingT = 0;
-let micSrc = null, micProc = null, micSink = null, vBuf = new Uint8Array(12 + VCHUNK), vLen = 0, vPos = 0;
-const UID_BYTES = new TextEncoder().encode(uid);
+let micSrc = null, micProc = null, micSink = null, vBuf = new Uint8Array(VCHUNK), vLen = 0, vPos = 0;
+let enc = null, encTs = 0, opusPack = [];
 function b64(u8){ let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i+0x8000)); return btoa(s); }
 function unb64(str){ const s = atob(str), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+const stopStream = st => { if (st && st.getTracks) st.getTracks().forEach(t => t.stop()); };
 function ensureAudio(){
   try{
-    if (!actx){ const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; actx = new AC();
-      voiceGain = actx.createGain(); voiceGain.gain.value = voiceVol; voiceGain.connect(actx.destination); }
+    if (!actx){
+      const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
+      try{ actx = new AC({ sampleRate:48000, latencyHint:'interactive' }); }catch(e){ actx = new AC(); }
+      voiceGain = actx.createGain(); voiceGain.gain.value = voiceVol; voiceGain.connect(actx.destination);
+    }
     if (actx.state === 'suspended') actx.resume().catch(() => {});
   }catch(e){ return null; }
   return actx;
@@ -595,18 +614,49 @@ function muEnc(x){ const M = 32635; let v = Math.max(-1, Math.min(1, x))*32767|0
   let e = 7; for (let m = 0x4000; (v & m) === 0 && e > 0; m >>= 1) e--; const man = (v >> (e+3)) & 0x0f; return ~(sign | (e << 4) | man) & 0xff; }
 const MUDEC = new Float32Array(256);
 for (let i = 0; i < 256; i++){ const u = ~i & 0xff, sign = u & 0x80, e = (u >> 4) & 7, man = u & 0x0f; let v = ((man << 3) + 0x84) << e; v -= 0x84; MUDEC[i] = (sign ? -v : v)/32768; }
-function startVoice(){
-  const ctx = ensureAudio(); if (!ctx || !localStream) return;
+const sendVoice = (kind, u8) => { if (client && netReady) try{ client.publish(BASE+'voice', kind + uid + b64(u8), { qos:0 }); }catch(e){} };
+async function makeEncoder(){
+  try{
+    if (!('AudioEncoder' in window) || !actx || actx.sampleRate !== 48000) return null;
+    const cfg = { codec:'opus', sampleRate:48000, numberOfChannels:1, bitrate:64000 };
+    const sup = await AudioEncoder.isConfigSupported(cfg); if (!sup.supported) return null;
+    const e = new AudioEncoder({
+      output: ch => {
+        const b = new Uint8Array(ch.byteLength); ch.copyTo(b); opusPack.push(b);
+        if (opusPack.length >= 3){                                    // 3 khung 20 ms = 60 ms mỗi gói
+          let n = 0; opusPack.forEach(p => n += 2 + p.length);
+          const out = new Uint8Array(n); let o = 0;
+          opusPack.forEach(p => { out[o] = p.length >> 8; out[o+1] = p.length & 255; out.set(p, o+2); o += 2 + p.length; });
+          opusPack = []; sendVoice('o', out);
+        }
+      },
+      error: () => { enc = null; }
+    });
+    e.configure(cfg); return e;
+  }catch(e){ return null; }
+}
+async function startVoice(){
+  const ctx = ensureAudio(); if (!ctx || !localStream || micProc) return;
+  enc = await makeEncoder(); encTs = 0; opusPack = [];
+  if (!localStream || micProc) return;
   micSrc = ctx.createMediaStreamSource(localStream);
-  micProc = ctx.createScriptProcessor(4096, 1, 1); micSink = ctx.createGain(); micSink.gain.value = 0;
-  const ratio = ctx.sampleRate / VRATE; vPos = 0; vLen = 0; vBuf.set(UID_BYTES, 0);
+  micProc = ctx.createScriptProcessor(1024, 1, 1); micSink = ctx.createGain(); micSink.gain.value = 0;
+  const ratio = ctx.sampleRate / VRATE; vPos = 0; vLen = 0;
   micProc.onaudioprocess = ev => {
     const inp = ev.inputBuffer.getChannelData(0);
-    while (vPos < inp.length){
+    if (enc && enc.state === 'configured'){
+      try{
+        const data = new Float32Array(inp);
+        const ad = new AudioData({ format:'f32-planar', sampleRate:48000, numberOfFrames:data.length, numberOfChannels:1, timestamp:Math.round(encTs), data });
+        encTs += data.length/48000*1e6; enc.encode(ad); ad.close();
+      }catch(e){ enc = null; }
+      return;
+    }
+    while (vPos < inp.length){                                       // dự phòng: mu-law 16 kHz, gói 100 ms
       const a = Math.floor(vPos), b = Math.min(inp.length-1, Math.ceil(vPos + ratio - 1));
       let sum = 0; for (let k = a; k <= b; k++) sum += inp[k];
-      vBuf[12 + vLen++] = muEnc(sum/(b-a+1)*1.3);
-      if (vLen === VCHUNK){ if (client && netReady) client.publish(BASE+'voice', b64(vBuf), { qos:0 }); vLen = 0; }
+      vBuf[vLen++] = muEnc(sum/(b-a+1)*1.3);
+      if (vLen === VCHUNK){ sendVoice('m', vBuf); vLen = 0; }
       vPos += ratio;
     }
     vPos -= inp.length;
@@ -615,19 +665,55 @@ function startVoice(){
 }
 function stopVoice(){
   try{ if (micProc){ micProc.onaudioprocess = null; micProc.disconnect(); } if (micSrc) micSrc.disconnect(); if (micSink) micSink.disconnect(); }catch(e){}
-  micSrc = micProc = micSink = null; vLen = 0;
+  try{ if (enc && enc.state !== 'closed') enc.close(); }catch(e){}
+  micSrc = micProc = micSink = enc = null; vLen = 0; opusPack = [];
 }
-function playVoice(u8){
-  if (!u8 || u8.length < 13 || u8.length > 12 + VCHUNK*2) return;
-  const from = new TextDecoder().decode(u8.subarray(0,12));
-  if (from === uid || !mic || mic.uid !== from) return;           // chỉ người đang cầm mic
-  const ctx = ensureAudio(); if (!ctx || ctx.state !== 'running'){ $('#unlock').classList.add('on'); return; }
-  const n = u8.length - 12, buf = ctx.createBuffer(1, n, VRATE), ch = buf.getChannelData(0);
-  for (let i = 0; i < n; i++) ch[i] = MUDEC[u8[12+i]];
+function schedule(f, sr){
+  const ctx = actx; if (!ctx) return;
+  const buf = ctx.createBuffer(1, f.length, sr); buf.getChannelData(0).set(f);
   const src = ctx.createBufferSource(); src.buffer = buf; src.connect(voiceGain);
   const t = ctx.currentTime;
-  if (nextPlay < t + 0.05 || nextPlay > t + 1.2) nextPlay = t + 0.3;   // bộ đệm chống giật
+  if (nextPlay < t + 0.02 || nextPlay > t + 0.8) nextPlay = t + 0.12;   // bộ đệm chống giật ~0,12 giây
   src.start(nextPlay); nextPlay += buf.duration;
+}
+let dec = null, decTs = 0, warnedDecoder = false;
+function getDecoder(){
+  if (dec && dec.state === 'configured') return dec;
+  if (!('AudioDecoder' in window)){
+    if (!warnedDecoder){ warnedDecoder = true; toast('Trình duyệt này không phát được giọng hát chất lượng cao. Hãy dùng Chrome hoặc Edge bản mới.'); }
+    return null;
+  }
+  try{
+    dec = new AudioDecoder({
+      output: ad => {
+        try{ const f = new Float32Array(ad.numberOfFrames);
+          try{ ad.copyTo(f, { planeIndex:0, format:'f32-planar' }); }catch(e){ ad.copyTo(f, { planeIndex:0 }); }
+          schedule(f, ad.sampleRate); }catch(e){}
+        ad.close();
+      },
+      error: () => { dec = null; }
+    });
+    dec.configure({ codec:'opus', sampleRate:48000, numberOfChannels:1 }); decTs = 0;
+  }catch(e){ dec = null; }
+  return dec;
+}
+function playVoice(txt){
+  if (voiceMode !== 'game' || typeof txt !== 'string' || txt.length < 14 || txt.length > 20000) return;
+  const kind = txt[0], from = txt.slice(1,13);
+  if (from === uid || !mic || mic.uid !== from) return;
+  const ctx = ensureAudio(); if (!ctx || ctx.state !== 'running'){ $('#unlock').classList.add('on'); return; }
+  let u8; try{ u8 = unb64(txt.slice(13)); }catch(e){ return; }
+  if (kind === 'm'){
+    const f = new Float32Array(u8.length); for (let i = 0; i < u8.length; i++) f[i] = MUDEC[u8[i]];
+    schedule(f, VRATE);
+  } else if (kind === 'o'){
+    const d = getDecoder(); if (!d) return;
+    for (let o = 0; o + 2 <= u8.length;){
+      const n = (u8[o] << 8) | u8[o+1]; o += 2; if (!n || o + n > u8.length) break;
+      try{ d.decode(new EncodedAudioChunk({ type:'key', timestamp:decTs, data:u8.subarray(o, o+n) })); }catch(e){}
+      decTs += 20000; o += n;
+    }
+  }
 }
 function applyMonitor(){
   try{
@@ -644,6 +730,11 @@ async function grabMic(){
   if (!netReady){ toast('Chưa kết nối phòng, đợi vài giây rồi thử lại.'); return; }
   if (holding || pendingMic) return;
   if (mic && mic.uid !== uid && present(mic.uid)){ toast(mic.name+' đang cầm mic.'); return; }
+  if (voiceMode === 'discord'){
+    pendingMic = true; net.send({ t:'mic', on:true });
+    clearTimeout(pendingT); pendingT = setTimeout(() => { if (pendingMic){ pendingMic = null; toast('Chưa cầm được mic, thử lại nhé.'); } }, 5000);
+    checkMic(); return;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ toast('Trình duyệt này không hỗ trợ mic. Hãy dùng Chrome, Edge hoặc Safari.'); return; }
   ensureAudio();
   let stream;
@@ -651,27 +742,33 @@ async function grabMic(){
   catch(e){ toast('Chưa dùng được mic. Bấm biểu tượng ổ khoá cạnh địa chỉ trang và cho phép Micro. Nếu đang mở trong ứng dụng Claude, hãy mở bằng Chrome.'); return; }
   pendingMic = stream; net.send({ t:'mic', on:true });
   clearTimeout(pendingT);
-  pendingT = setTimeout(() => { if (pendingMic){ pendingMic.getTracks().forEach(t => t.stop()); pendingMic = null; toast('Chưa cầm được mic, thử lại nhé.'); } }, 5000);
+  pendingT = setTimeout(() => { if (pendingMic){ stopStream(pendingMic); pendingMic = null; toast('Chưa cầm được mic, thử lại nhé.'); } }, 5000);
   checkMic();
 }
 function checkMic(){            // gọi sau mỗi lần trạng thái phòng thay đổi
   if (pendingMic && mic){
     if (mic.uid === uid){
-      localStream = pendingMic; pendingMic = null; clearTimeout(pendingT); holding = true;
-      startVoice(); applyMonitor(); toast('Bạn đã cầm mic. Cả phòng đang nghe giọng bạn. Bấm F để trả mic.');
+      localStream = pendingMic === true ? null : pendingMic; pendingMic = null; clearTimeout(pendingT); holding = true;
+      toast(voiceMode === 'discord' ? 'Bạn đã cầm mic. Hát qua Discord: nhớ bật mic trong kênh thoại Discord.' : 'Bạn đã cầm mic. Cả phòng đang nghe giọng bạn. Bấm F để trả mic.');
     } else if (present(mic.uid)){
-      pendingMic.getTracks().forEach(t => t.stop()); pendingMic = null; clearTimeout(pendingT); toast(mic.name+' vừa cầm mic trước bạn.');
+      stopStream(pendingMic); pendingMic = null; clearTimeout(pendingT); toast(mic.name+' vừa cầm mic trước bạn.');
     }
   }
   if (holding && (!mic || mic.uid !== uid)) stopHolding();
+  if (holding){
+    if (voiceMode === 'game' && localStream && !micProc) startVoice();
+    if (voiceMode === 'discord' && micProc) stopVoice();
+    if (voiceMode === 'game' && !localStream){ holding = false; net.send({ t:'mic', on:false }); toast('Phòng đã chuyển sang hát trong game. Bấm F ở cây mic để cầm lại mic.'); }
+  }
+  applyMonitor();
 }
 function stopHolding(){
   holding = false; stopVoice();
-  if (localStream){ localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+  stopStream(localStream); localStream = null;
   applyMonitor();
 }
 function releaseMic(){
-  if (pendingMic){ pendingMic.getTracks().forEach(t => t.stop()); pendingMic = null; }
+  if (pendingMic){ stopStream(pendingMic); pendingMic = null; }
   if (holding) stopHolding();
   net.send({ t:'mic', on:false });
 }
@@ -706,7 +803,7 @@ const validP = p => Array.isArray(p) && p.length === 3 && p.every(Number.isFinit
 // Mọi thay đổi (thêm bài, hát, cầm mic…) được áp dụng lên trạng thái mới nhất rồi gửi cho cả phòng.
 const net = { send(m){ if (netReady) applyOp(m); } };
 function publishState(){
-  const st = { queue, now, mic, at:Date.now(), by:uid };
+  const st = { queue, now, mic, voice:voiceMode, discord:discordUrl, at:Date.now(), by:uid };
   try{ client.publish(BASE+'state', JSON.stringify(st), { qos:1, retain:true }); }catch(e){}
   applyState(st);
 }
@@ -736,6 +833,10 @@ function applyOp(m){
     case 'stop': if (!now || (m.key && m.key !== now.vid + ':' + now.startedAt)) return; now = null; break;
     case 'pause': if (!now || now.uid !== uid || now.state === 'paused') return; now = Object.assign({}, now, { pos:(serverNow()-now.startedAt)/1000, state:'paused' }); break;
     case 'resume': if (!now || now.uid !== uid || now.state !== 'paused') return; now = Object.assign({}, now, { startedAt:serverNow() - now.pos*1000, state:'playing' }); break;
+    case 'voice':
+      if (m.mode !== 'game' && m.mode !== 'discord') return;
+      voiceMode = m.mode; if (typeof m.url === 'string') discordUrl = validDiscord(m.url) ? m.url.trim() : '';
+      break;
     case 'mic':
       if (m.on){ if (mic && mic.uid !== uid && present(mic.uid)) return; mic = { uid, name:who.name, color:who.color }; }
       else { if (!mic || mic.uid !== uid) return; mic = null; }
@@ -756,6 +857,10 @@ function applyState(st){
   if (now && now.state === 'playing' && serverNow() - now.startedAt > 20*60*1000) now = null;     // bài quá 20 phút coi như xong
   if ((now ? now.vid + now.startedAt : '') !== prevKey) videoError = '';
   mic = st.mic && typeof st.mic.uid === 'string' ? { uid:st.mic.uid, name:clean(st.mic.name,24) || 'Khách', color:safeColor(st.mic.color) } : null;
+  const vm = st.voice === 'discord' ? 'discord' : 'game';
+  if (vm !== voiceMode){ voiceMode = vm; loadDelay(); }
+  discordUrl = typeof st.discord === 'string' && validDiscord(st.discord) ? st.discord.trim() : '';
+  renderVoiceBox();
   renderUI(); syncVideo(); checkMic();
 }
 function onPresence(id, txt){
@@ -786,6 +891,45 @@ setInterval(() => {
   if (dirty) publishState();
 }, 2000);
 
+/* ----- đồng bộ giờ với máy người hát ----- */
+function onTime(txt){
+  let m; try{ m = JSON.parse(txt); }catch(e){ return; }
+  if (!m || typeof m.f !== 'string' || m.f.length !== 12 || !Number.isFinite(m.c)) return;
+  if (m.a){
+    if (!Number.isFinite(m.h)) return;
+    const t = Date.now(), rtt = t - m.c; if (rtt < 0 || rtt > 5000) return;
+    const b = bestRtt.get(m.f);
+    if (!b || rtt <= b.rtt * 1.2 || t - b.at > 30000){ bestRtt.set(m.f, { rtt, at:t }); clockOff.set(m.f, m.h + rtt/2 - t); }
+  } else {
+    try{ client.publish(BASE+'time/'+m.f, JSON.stringify({ a:1, f:uid, c:m.c, h:Date.now() }), { qos:0 }); }catch(e){}
+  }
+}
+setInterval(() => {
+  if (!netReady || !now || now.uid === uid) return;
+  try{ client.publish(BASE+'time/'+now.uid, JSON.stringify({ f:uid, c:Date.now() }), { qos:0 }); }catch(e){}
+}, 1500);
+
+/* ----- khung "Giọng hát": trong game hoặc Discord ----- */
+function validDiscord(u){ return typeof u === 'string' && /^https:\/\/(discord\.gg|(www\.)?discord\.com\/(invite|channels))\/[\w\-\/]+$/.test(u.trim()) && u.length < 200; }
+function renderVoiceBox(){
+  $('#vmGame').setAttribute('aria-pressed', String(voiceMode === 'game'));
+  $('#vmDiscord').setAttribute('aria-pressed', String(voiceMode === 'discord'));
+  $('#discordRow').style.display = voiceMode === 'discord' ? '' : 'none';
+  if (document.activeElement !== $('#discordUrl')) $('#discordUrl').value = discordUrl;
+  const j = $('#discordJoin'); j.style.display = voiceMode === 'discord' && discordUrl ? '' : 'none'; if (discordUrl) j.href = discordUrl;
+  $('#monitorRow').style.display = voiceMode === 'game' ? '' : 'none';
+  $('#musicDelay').value = musicDelay; $('#delayVal').textContent = musicDelay;
+}
+$('#vmGame').onclick = () => { if (voiceMode !== 'game') net.send({ t:'voice', mode:'game' }); };
+$('#vmDiscord').onclick = () => { if (voiceMode !== 'discord') net.send({ t:'voice', mode:'discord' }); };
+$('#discordSave').onclick = () => {
+  const u = $('#discordUrl').value.trim();
+  if (u && !validDiscord(u)){ toast('Link chưa đúng. Trong Discord, bấm chuột phải vào kênh thoại, chọn “Mời mọi người” rồi sao chép link dạng https://discord.gg/…'); return; }
+  net.send({ t:'voice', mode:'discord', url:u }); toast(u ? 'Đã lưu link Discord. Mọi người trong phòng thấy nút “Vào kênh thoại Discord”.' : 'Đã xoá link Discord.');
+};
+$('#musicDelay').oninput = e => { musicDelay = clamp(+e.target.value || 0, 0, 1500); $('#delayVal').textContent = musicDelay; LS.set(delayKey(), String(musicDelay)); if (ytBig && ytBig._vid) ytBig._seekAt = 0; };
+loadDelay(); renderVoiceBox();
+
 /* ----- vào phòng ----- */
 let lastSent = '', lastSentAt = 0, joined = false, brokerIdx = 0;
 function pushPresence(force){
@@ -809,13 +953,14 @@ function connect(){
   client = c;
   c.on('connect', () => {
     ok = true; netReady = true; if (!joinedAt) joinedAt = Date.now();
-    c.subscribe([BASE+'state', BASE+'pres/+', BASE+'voice'], { qos:0 });
+    c.subscribe([BASE+'state', BASE+'pres/+', BASE+'voice', BASE+'time/'+uid], { qos:0 });
     setStatus('Đã vào phòng. Gửi link mời để rủ bạn bè.' + (brokerIdx ? ' (máy chủ dự phòng)' : ''));
     pushPresence(true);
   });
   c.on('message', (topic, payload) => {
     const sub = topic.slice(BASE.length);
-    if (sub === 'voice'){ try{ playVoice(unb64(new TextDecoder().decode(payload))); }catch(e){} }
+    if (sub === 'voice') playVoice(new TextDecoder().decode(payload));
+    else if (sub === 'time/'+uid) onTime(new TextDecoder().decode(payload));
     else if (sub === 'state'){ let st; try{ st = JSON.parse(new TextDecoder().decode(payload)); }catch(e){ return; } if (st && st.by !== uid) applyState(st); }
     else if (sub.startsWith('pres/')) onPresence(sub.slice(5), new TextDecoder().decode(payload));
   });
