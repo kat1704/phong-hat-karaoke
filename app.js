@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
 
-// Kết nối trực tiếp giữa các máy bằng PeerJS (nạp trong index.html, biến toàn cục Peer). Không cần máy chủ riêng.
+// Kết nối phòng qua máy chủ trung chuyển MQTT công cộng (thư viện mqtt nạp trong index.html). Vào được từ mọi loại mạng.
 
 /* ================= tiện ích ================= */
 const $ = s => document.querySelector(s);
@@ -38,7 +38,7 @@ if (!/^[a-z0-9]{4,24}$/.test(roomId)){
   params.set('room', roomId);
   history.replaceState(null, '', location.pathname + '?' + params.toString());
 }
-const HOST_ID = 'phonghat-karaoke-v1-' + roomId;
+const BASE = 'phkaraoke/v1/' + roomId + '/';
 const inviteLink = () => location.origin + location.pathname + '?room=' + roomId;
 
 /* ================= cảnh 3D ================= */
@@ -204,7 +204,8 @@ function resize(){
 window.addEventListener('resize', resize); resize();
 
 /* ================= trạng thái chung ================= */
-let uid = null, peer = null, isHost = false, netReady = false, hostConn = null;
+const uid = (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2) + 'xxxxxxxxxxxx').slice(0,12);
+let client = null, netReady = false, joinedAt = 0;
 let queue = [], now = null, mic = null, videoError = '';
 const users = new Map();            // id -> { n, c, p, r }
 let serverOffset = 0;               // lệch giờ so với máy chủ phòng
@@ -569,56 +570,85 @@ function syncVideo(){
   lastNear = near;
 }
 setInterval(syncVideo, 1000);
-$('#unlock').onclick = () => { if (ytBig){ ytBig.unMute(); ytBig.setVolume(musicVol); ytBig.playVideo(); } audios().forEach(a => a.play().catch(() => {})); $('#unlock').classList.remove('on'); };
+$('#unlock').onclick = () => { if (ytBig){ ytBig.unMute(); ytBig.setVolume(musicVol); ytBig.playVideo(); } ensureAudio(); $('#unlock').classList.remove('on'); };
 $('#musicVol').oninput = e => { musicVol = +e.target.value; if (ytBig && ytBig.setVolume) ytBig.setVolume(musicVol); };
-$('#voiceVol').oninput = e => { voiceVol = +e.target.value/100; audios().forEach(a => a.volume = voiceVol); };
+$('#voiceVol').oninput = e => { voiceVol = +e.target.value/100; if (voiceGain) voiceGain.gain.value = voiceVol; if (monGain) monGain.gain.value = voiceVol; };
 
-/* ================= mic: truyền giọng hát (WebRTC qua PeerJS) ================= */
-const outCalls = new Map(), inCalls = new Map();   // id đối phương -> cuộc gọi
+/* ================= mic: truyền giọng hát qua máy chủ trung chuyển ================= */
+// Mic -> 16 kHz -> nén mu-law 8 bit -> gửi từng đoạn 0,2 giây. Chỉ giọng người đang cầm mic được phát.
+const VRATE = 16000, VCHUNK = 3200;
+let actx = null, voiceGain = null, monSrc = null, monGain = null, nextPlay = 0;
 let localStream = null, holding = false, pendingMic = null, pendingT = 0;
-let actx = null, monSrc = null, monGain = null;
-const audios = () => [...inCalls.values()].map(e => e.audio).filter(Boolean);
-function callPeer(id){
-  if (!holding || !localStream || !peer || id === uid || outCalls.has(id)) return;
-  let call; try{ call = peer.call(id, localStream); }catch(e){ return; }
-  if (!call) return;
-  outCalls.set(id, call);
-  const drop = () => { if (outCalls.get(id) === call) outCalls.delete(id); };
-  call.on('close', drop); call.on('error', drop);
+let micSrc = null, micProc = null, micSink = null, vBuf = new Uint8Array(12 + VCHUNK), vLen = 0, vPos = 0;
+const UID_BYTES = new TextEncoder().encode(uid);
+function b64(u8){ let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i+0x8000)); return btoa(s); }
+function unb64(str){ const s = atob(str), u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+function ensureAudio(){
+  try{
+    if (!actx){ const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null; actx = new AC();
+      voiceGain = actx.createGain(); voiceGain.gain.value = voiceVol; voiceGain.connect(actx.destination); }
+    if (actx.state === 'suspended') actx.resume().catch(() => {});
+  }catch(e){ return null; }
+  return actx;
 }
-function callAll(){ users.forEach((_, id) => { if (id !== uid) callPeer(id); }); }
-function onCall(call){
-  const old = inCalls.get(call.peer);
-  if (old){ try{ old.call.close(); }catch(_){} if (old.audio) old.audio.remove(); }
-  const e = { call, audio:null }; inCalls.set(call.peer, e);
-  call.answer();
-  call.on('stream', st => {
-    if (!e.audio){ e.audio = document.createElement('audio'); e.audio.autoplay = true; e.audio.style.display = 'none'; document.body.appendChild(e.audio); }
-    e.audio.srcObject = st; e.audio.volume = voiceVol; e.audio.muted = !(mic && mic.uid === call.peer);
-    e.audio.play().catch(() => $('#unlock').classList.add('on'));
-  });
-  call.on('close', () => { if (inCalls.get(call.peer) === e){ if (e.audio){ e.audio.srcObject = null; e.audio.remove(); } inCalls.delete(call.peer); } });
+function muEnc(x){ const M = 32635; let v = Math.max(-1, Math.min(1, x))*32767|0; const sign = v < 0 ? 0x80 : 0; if (v < 0) v = -v; if (v > M) v = M; v += 0x84;
+  let e = 7; for (let m = 0x4000; (v & m) === 0 && e > 0; m >>= 1) e--; const man = (v >> (e+3)) & 0x0f; return ~(sign | (e << 4) | man) & 0xff; }
+const MUDEC = new Float32Array(256);
+for (let i = 0; i < 256; i++){ const u = ~i & 0xff, sign = u & 0x80, e = (u >> 4) & 7, man = u & 0x0f; let v = ((man << 3) + 0x84) << e; v -= 0x84; MUDEC[i] = (sign ? -v : v)/32768; }
+function startVoice(){
+  const ctx = ensureAudio(); if (!ctx || !localStream) return;
+  micSrc = ctx.createMediaStreamSource(localStream);
+  micProc = ctx.createScriptProcessor(4096, 1, 1); micSink = ctx.createGain(); micSink.gain.value = 0;
+  const ratio = ctx.sampleRate / VRATE; vPos = 0; vLen = 0; vBuf.set(UID_BYTES, 0);
+  micProc.onaudioprocess = ev => {
+    const inp = ev.inputBuffer.getChannelData(0);
+    while (vPos < inp.length){
+      const a = Math.floor(vPos), b = Math.min(inp.length-1, Math.ceil(vPos + ratio - 1));
+      let sum = 0; for (let k = a; k <= b; k++) sum += inp[k];
+      vBuf[12 + vLen++] = muEnc(sum/(b-a+1)*1.3);
+      if (vLen === VCHUNK){ if (client && netReady) client.publish(BASE+'voice', b64(vBuf), { qos:0 }); vLen = 0; }
+      vPos += ratio;
+    }
+    vPos -= inp.length;
+  };
+  micSrc.connect(micProc); micProc.connect(micSink); micSink.connect(ctx.destination);
 }
-function updateVoiceMute(){ inCalls.forEach((e, id) => { if (e.audio) e.audio.muted = !(mic && mic.uid === id); }); }
+function stopVoice(){
+  try{ if (micProc){ micProc.onaudioprocess = null; micProc.disconnect(); } if (micSrc) micSrc.disconnect(); if (micSink) micSink.disconnect(); }catch(e){}
+  micSrc = micProc = micSink = null; vLen = 0;
+}
+function playVoice(u8){
+  if (!u8 || u8.length < 13 || u8.length > 12 + VCHUNK*2) return;
+  const from = new TextDecoder().decode(u8.subarray(0,12));
+  if (from === uid || !mic || mic.uid !== from) return;           // chỉ người đang cầm mic
+  const ctx = ensureAudio(); if (!ctx || ctx.state !== 'running'){ $('#unlock').classList.add('on'); return; }
+  const n = u8.length - 12, buf = ctx.createBuffer(1, n, VRATE), ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) ch[i] = MUDEC[u8[12+i]];
+  const src = ctx.createBufferSource(); src.buffer = buf; src.connect(voiceGain);
+  const t = ctx.currentTime;
+  if (nextPlay < t + 0.05 || nextPlay > t + 1.2) nextPlay = t + 0.3;   // bộ đệm chống giật
+  src.start(nextPlay); nextPlay += buf.duration;
+}
 function applyMonitor(){
   try{
     const want = holding && localStream && $('#monitor').checked;
     if (!want){ if (monSrc){ monSrc.disconnect(); monGain.disconnect(); monSrc = monGain = null; } return; }
-    if (!actx){ const AC = window.AudioContext || window.webkitAudioContext; actx = new AC(); }
-    if (actx.state === 'suspended') actx.resume();
-    if (!monSrc){ monSrc = actx.createMediaStreamSource(localStream); monGain = actx.createGain(); monSrc.connect(monGain); monGain.connect(actx.destination); }
+    const ctx = ensureAudio(); if (!ctx) return;
+    if (!monSrc){ monSrc = ctx.createMediaStreamSource(localStream); monGain = ctx.createGain(); monSrc.connect(monGain); monGain.connect(ctx.destination); }
     monGain.gain.value = voiceVol;
   }catch(e){}
 }
 $('#monitor').onchange = () => { applyMonitor(); if ($('#monitor').checked && !holding) toast('Cầm mic (F) ở cây mic trên sân khấu để nghe giọng mình.'); };
+const present = id => id === uid || users.has(id);
 async function grabMic(){
-  if (!netReady){ toast('Chưa kết nối phòng.'); return; }
+  if (!netReady){ toast('Chưa kết nối phòng, đợi vài giây rồi thử lại.'); return; }
   if (holding || pendingMic) return;
-  if (mic && mic.uid !== uid && users.has(mic.uid)){ toast(mic.name+' đang cầm mic.'); return; }
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ toast('Trình duyệt này không hỗ trợ mic. Hãy dùng Chrome hoặc Edge.'); return; }
+  if (mic && mic.uid !== uid && present(mic.uid)){ toast(mic.name+' đang cầm mic.'); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ toast('Trình duyệt này không hỗ trợ mic. Hãy dùng Chrome, Edge hoặc Safari.'); return; }
+  ensureAudio();
   let stream;
   try{ stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true, autoGainControl:true } }); }
-  catch(e){ toast('Chưa dùng được mic. Bấm biểu tượng ổ khoá cạnh địa chỉ trang và cho phép Micro.'); return; }
+  catch(e){ toast('Chưa dùng được mic. Bấm biểu tượng ổ khoá cạnh địa chỉ trang và cho phép Micro. Nếu đang mở trong ứng dụng Claude, hãy mở bằng Chrome.'); return; }
   pendingMic = stream; net.send({ t:'mic', on:true });
   clearTimeout(pendingT);
   pendingT = setTimeout(() => { if (pendingMic){ pendingMic.getTracks().forEach(t => t.stop()); pendingMic = null; toast('Chưa cầm được mic, thử lại nhé.'); } }, 5000);
@@ -628,18 +658,15 @@ function checkMic(){            // gọi sau mỗi lần trạng thái phòng th
   if (pendingMic && mic){
     if (mic.uid === uid){
       localStream = pendingMic; pendingMic = null; clearTimeout(pendingT); holding = true;
-      applyMonitor(); toast('Bạn đã cầm mic. Cả phòng đang nghe giọng bạn. Bấm F để trả mic.');
-    } else if (users.has(mic.uid)){
+      startVoice(); applyMonitor(); toast('Bạn đã cầm mic. Cả phòng đang nghe giọng bạn. Bấm F để trả mic.');
+    } else if (present(mic.uid)){
       pendingMic.getTracks().forEach(t => t.stop()); pendingMic = null; clearTimeout(pendingT); toast(mic.name+' vừa cầm mic trước bạn.');
     }
   }
   if (holding && (!mic || mic.uid !== uid)) stopHolding();
-  if (holding) callAll();
-  updateVoiceMute();
 }
 function stopHolding(){
-  holding = false;
-  outCalls.forEach(c => { try{ c.close(); }catch(_){} }); outCalls.clear();
+  holding = false; stopVoice();
   if (localStream){ localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   applyMonitor();
 }
@@ -653,9 +680,8 @@ function toggleMic(){
   else if (nearMic(1.4)) grabMic();
   else toast('Hãy đứng trong vòng sáng ở cây mic trên sân khấu.');
 }
-window.addEventListener('pagehide', () => { try{ if (peer) peer.destroy(); }catch(_){} });
 
-/* ================= kết nối phòng (PeerJS) ================= */
+/* ================= kết nối phòng ================= */
 const sw = $('#swatches');
 COLORS.forEach(c => {
   const b = document.createElement('button'); b.style.background = c; b.setAttribute('aria-label','Màu '+c);
@@ -672,195 +698,136 @@ async function copyInvite(){
 }
 $('#copyLink').onclick = copyInvite; $('#copyInvite').onclick = copyInvite;
 
-const PCONF = { debug:0, config:{ iceServers:[ { urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302'] } ] } };
-const conns = new Map();           // (chủ phòng) id -> kết nối
+const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
 const lastSeen = new Map();
-let posDirty = false;
 const rid = () => Math.random().toString(36).slice(2,10);
 const validP = p => Array.isArray(p) && p.length === 3 && p.every(Number.isFinite);
 
-// gửi một yêu cầu: chủ phòng tự xử lý, khách gửi lên chủ phòng
-const net = {
-  send(m){
-    if (!netReady) return;
-    if (isHost) hostHandle(uid, m);
-    else if (hostConn && hostConn.open){ try{ hostConn.send(m); }catch(_){} }
-  }
-};
-
-/* ----- chủ phòng ----- */
-function stateMsg(){
-  return { t:'state', queue, now, mic, users:[...users].map(([id,d]) => [id, d.n, d.c]), h:Date.now() };
+// Mọi thay đổi (thêm bài, hát, cầm mic…) được áp dụng lên trạng thái mới nhất rồi gửi cho cả phòng.
+const net = { send(m){ if (netReady) applyOp(m); } };
+function publishState(){
+  const st = { queue, now, mic, at:Date.now(), by:uid };
+  try{ client.publish(BASE+'state', JSON.stringify(st), { qos:1, retain:true }); }catch(e){}
+  applyState(st);
 }
-function broadcast(m){ conns.forEach(c => { if (c.open) try{ c.send(m); }catch(_){} }); }
-function changed(){ applyState(stateMsg()); broadcast(stateMsg()); }
-function hostHandle(from, m){
+function applyOp(m){
   if (!m || typeof m !== 'object') return;
-  lastSeen.set(from, Date.now());
-  const u = users.get(from), who = { name: u ? u.n : 'Khách', color: u ? u.c : '#cccccc' };
+  if (m.t === 'me'){
+    try{ client.publish(BASE+'pres/'+uid, JSON.stringify({ n:m.n, c:m.c, p:m.p, r:m.r }), { qos:0 }); }catch(e){}
+    return;
+  }
+  const who = { name: me.name || 'Khách', color: me.color };
   switch (m.t){
-    case 'me': {
-      const d = { n: clean(m.n,24) || 'Khách', c: safeColor(m.c), p: validP(m.p) ? m.p : [0,0,0], r: Number.isFinite(m.r) ? m.r : 0 };
-      const isNew = !u || u.n !== d.n || u.c !== d.c;
-      users.set(from, d); posDirty = true;
-      if (from !== uid) upsertAvatar(from, d);
-      if (isNew) changed();
-      break;
-    }
     case 'add': {
       const it = m.item; if (!it || !validVid(it.vid) || queue.length >= 50) return;
-      queue.push({ id:rid(), vid:it.vid, title:clean(it.title,80) || 'Bài hát', uid:from, name:who.name, color:who.color, ts:Date.now() });
-      changed(); break;
+      queue = queue.concat([{ id:rid(), vid:it.vid, title:clean(it.title,80) || 'Bài hát', uid, name:who.name, color:who.color, ts:Date.now() }]);
+      break;
     }
-    case 'remove': queue = queue.filter(q => !(q.id === m.id && q.uid === from)); changed(); break;
+    case 'remove': queue = queue.filter(q => !(q.id === m.id && q.uid === uid)); break;
     case 'start': {
       if (now) return;
       let q = null;
-      if (m.id){ q = queue.find(x => x.id === m.id && x.uid === from); if (!q) return; queue = queue.filter(x => x !== q); }
+      if (m.id){ q = queue.find(x => x.id === m.id && x.uid === uid); if (!q) return; queue = queue.filter(x => x !== q); }
       else if (m.item && validVid(m.item.vid)) q = { vid:m.item.vid, title:clean(m.item.title,80) || 'Bài hát' };
       else return;
-      now = { vid:q.vid, title:q.title, uid:from, name:who.name, color:who.color, startedAt:Date.now(), state:'playing', pos:0 };
-      changed(); break;
-    }
-    case 'stop': if (now && (!m.key || m.key === now.vid + ':' + now.startedAt)){ now = null; changed(); } break;
-    case 'pause': if (now && now.uid === from && now.state !== 'paused'){ now.pos = (Date.now()-now.startedAt)/1000; now.state = 'paused'; changed(); } break;
-    case 'resume': if (now && now.uid === from && now.state === 'paused'){ now.startedAt = Date.now() - now.pos*1000; now.state = 'playing'; changed(); } break;
-    case 'mic':
-      if (m.on){ if (!mic || mic.uid === from || !users.has(mic.uid)){ mic = { uid:from, name:who.name, color:who.color }; changed(); } }
-      else if (mic && mic.uid === from){ mic = null; changed(); }
+      now = { vid:q.vid, title:q.title, uid, name:who.name, color:who.color, startedAt:serverNow(), state:'playing', pos:0 };
       break;
+    }
+    case 'stop': if (!now || (m.key && m.key !== now.vid + ':' + now.startedAt)) return; now = null; break;
+    case 'pause': if (!now || now.uid !== uid || now.state === 'paused') return; now = Object.assign({}, now, { pos:(serverNow()-now.startedAt)/1000, state:'paused' }); break;
+    case 'resume': if (!now || now.uid !== uid || now.state !== 'paused') return; now = Object.assign({}, now, { startedAt:serverNow() - now.pos*1000, state:'playing' }); break;
+    case 'mic':
+      if (m.on){ if (mic && mic.uid !== uid && present(mic.uid)) return; mic = { uid, name:who.name, color:who.color }; }
+      else { if (!mic || mic.uid !== uid) return; mic = null; }
+      break;
+    default: return;
   }
+  publishState();
 }
-function hostDrop(id){
-  conns.delete(id); lastSeen.delete(id);
-  if (!users.has(id)) return;
-  users.delete(id); removeAvatar(id);
-  if (mic && mic.uid === id) mic = null;
-  if (now && now.uid === id) now = null;          // người hát rời phòng
-  changed();
-}
-function onHostConn(c){
-  c.on('open', () => { conns.set(c.peer, c); lastSeen.set(c.peer, Date.now()); try{ c.send(stateMsg()); }catch(_){} });
-  c.on('data', m => {
-    if (m && m.t === 'ping'){ lastSeen.set(c.peer, Date.now()); try{ c.send({ t:'pong', c:m.c, h:Date.now() }); }catch(_){} return; }
-    hostHandle(c.peer, m);
-  });
-  c.on('close', () => hostDrop(c.peer));
-  c.on('error', () => hostDrop(c.peer));
-}
-setInterval(() => {                      // chủ phòng: gửi vị trí mọi người 10 lần/giây
-  if (!isHost || !posDirty) return; posDirty = false;
-  const u = {}; users.forEach((d, id) => { u[id] = [d.p[0], d.p[1], d.p[2], d.r]; });
-  broadcast({ t:'pos', u });
-}, 100);
-setInterval(() => {                      // chủ phòng: loại người mất kết nối
-  if (!isHost) return;
-  const t = Date.now();
-  lastSeen.forEach((v, id) => { if (id !== uid && t - v > 12000){ const c = conns.get(id); try{ c && c.close(); }catch(_){} hostDrop(id); } });
-}, 3000);
 
-/* ----- áp dụng trạng thái (chủ phòng và khách) ----- */
+/* ----- áp dụng trạng thái phòng ----- */
 function applyState(st){
   if (!st || typeof st !== 'object') return;
-  queue = Array.isArray(st.queue) ? st.queue.filter(q => q && validVid(q.vid)).map(q => ({
+  queue = Array.isArray(st.queue) ? st.queue.filter(q => q && validVid(q.vid)).slice(0,50).map(q => ({
     id:String(q.id), vid:q.vid, title:clean(q.title,80) || 'Bài hát', uid:String(q.uid), name:clean(q.name,24) || 'Khách', color:safeColor(q.color), ts:Number(q.ts) || 0 })) : [];
   const v = st.now, prevKey = now ? now.vid + now.startedAt : '';
   now = v && validVid(v.vid) ? { vid:v.vid, title:clean(v.title,80) || 'Bài hát', uid:String(v.uid), name:clean(v.name,24) || 'Khách', color:safeColor(v.color),
     startedAt:Number(v.startedAt) || serverNow(), state: v.state === 'paused' ? 'paused' : 'playing', pos:Number(v.pos) || 0 } : null;
+  if (now && now.state === 'playing' && serverNow() - now.startedAt > 20*60*1000) now = null;     // bài quá 20 phút coi như xong
   if ((now ? now.vid + now.startedAt : '') !== prevKey) videoError = '';
   mic = st.mic && typeof st.mic.uid === 'string' ? { uid:st.mic.uid, name:clean(st.mic.name,24) || 'Khách', color:safeColor(st.mic.color) } : null;
-  if (Array.isArray(st.users) && !isHost){
-    const seen = new Set();
-    st.users.forEach(row => {
-      if (!Array.isArray(row)) return;
-      const [id, n, c] = row; if (typeof id !== 'string') return; seen.add(id);
-      const d = users.get(id) || { p:[0,0,0], r:0 }; d.n = clean(n,24) || 'Khách'; d.c = safeColor(c); users.set(id, d);
-      if (id !== uid && validP(d.p) && (d.p[0] || d.p[2])) upsertAvatar(id, d);
-    });
-    [...users.keys()].forEach(id => { if (!seen.has(id)){ users.delete(id); removeAvatar(id); } });
-  }
   renderUI(); syncVideo(); checkMic();
 }
-function applyPos(u){
-  if (!u || typeof u !== 'object') return;
-  Object.keys(u).forEach(id => {
-    if (id === uid) return; const a = u[id]; if (!Array.isArray(a) || a.length !== 4 || !a.every(Number.isFinite)) return;
-    const d = users.get(id); if (!d) return;
-    d.p = [a[0], a[1], a[2]]; d.r = a[3]; upsertAvatar(id, d);
-  });
+function onPresence(id, txt){
+  if (id === uid) return;
+  if (!txt || txt === 'bye'){ dropUser(id); return; }
+  let d; try{ d = JSON.parse(txt); }catch(e){ return; }
+  if (!d || !validP(d.p)) return;
+  const prev = users.get(id);
+  const nd = { n:clean(d.n,24) || 'Khách', c:safeColor(d.c), p:[clamp(d.p[0],-HW,HW), clamp(d.p[1],0,8), clamp(d.p[2],Z_FRONT,Z_BACK)], r:Number.isFinite(d.r) ? d.r : 0 };
+  users.set(id, nd); lastSeen.set(id, Date.now()); upsertAvatar(id, nd);
+  if (!prev || prev.n !== nd.n || prev.c !== nd.c){ renderPeople(); renderUI(); }
 }
+function dropUser(id){
+  lastSeen.delete(id);
+  if (!users.has(id)) return;
+  users.delete(id); removeAvatar(id); renderPeople(); renderUI();
+}
+setInterval(() => {
+  const t = Date.now();
+  lastSeen.forEach((v, id) => { if (t - v > 9000) dropUser(id); });
+  // người hát hoặc người cầm mic đã rời phòng: một máy (mã nhỏ nhất) dọn lại
+  if (!netReady || t - joinedAt < 12000) return;
+  const ids = [uid, ...users.keys()].sort();
+  if (ids[0] !== uid) return;
+  let dirty = false;
+  if (mic && !present(mic.uid)){ mic = null; dirty = true; }
+  if (now && !present(now.uid)){ now = null; dirty = true; }
+  if (dirty) publishState();
+}, 2000);
 
-/* ----- vào phòng: thử làm chủ phòng, nếu đã có chủ thì vào làm khách ----- */
-let lastSent = '', lastSentAt = 0, joined = false, starting = false;
+/* ----- vào phòng ----- */
+let lastSent = '', lastSentAt = 0, joined = false, brokerIdx = 0;
 function pushPresence(force){
   if (!netReady || !joined) return;
   const p = [+player.x.toFixed(2), +player.y.toFixed(2), +player.z.toFixed(2)], r = +yaw.toFixed(2);
   const sig = p.join(',') + r + me.name + me.color, t = Date.now();
-  if (!force && sig === lastSent && t - lastSentAt < 3000) return;
+  if (!force && sig === lastSent && t - lastSentAt < 2500) return;
   lastSent = sig; lastSentAt = t;
   net.send({ t:'me', n:me.name, c:me.color, p, r });
 }
 setInterval(() => pushPresence(false), 100);
-function attachPeer(p){
-  p.on('call', onCall);
-  p.on('disconnected', () => { try{ if (!p.destroyed) p.reconnect(); }catch(_){} });
-}
-function netFail(e){
-  console.error(e);
-  setStatus('Không kết nối được máy chủ phòng (' + ((e && e.type) || 'lỗi mạng') + '). Kiểm tra mạng rồi tải lại trang.');
-}
-function becomeHost(seed){
-  if (typeof Peer !== 'function'){ setStatus('Không tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang (Ctrl + F5).'); return; }
-  setStatus('Đang mở phòng…');
-  const p = new Peer(HOST_ID, PCONF);
-  p.on('open', id => {
-    peer = p; uid = id; isHost = true; netReady = true; serverOffset = 0; starting = false;
-    users.clear(); avatars.forEach((_, k) => removeAvatar(k));
-    if (seed){ queue = seed.queue || []; now = seed.now || null; } mic = null;
-    attachPeer(p); p.on('connection', onHostConn);
-    pushPresence(true); changed();
-    if (holding || pendingMic){ const had = holding; stopHolding(); if (had) grabMic(); }
-    setStatus('Bạn là chủ phòng. Gửi link mời để bạn bè vào cùng.');
-  });
-  p.on('error', e => {
-    if (e.type === 'unavailable-id'){ try{ p.destroy(); }catch(_){} joinAsGuest(); }
-    else if (!netReady) netFail(e);
-  });
-}
-function joinAsGuest(){
+function connect(){
+  if (typeof mqtt === 'undefined'){ setStatus('Không tải được thư viện kết nối. Kiểm tra mạng rồi tải lại trang (Ctrl + F5).'); return; }
+  const url = BROKERS[brokerIdx];
   setStatus('Đang vào phòng…');
-  const p = new Peer(PCONF);
-  p.on('open', id => {
-    peer = p; uid = id; isHost = false; attachPeer(p);
-    const c = p.connect(HOST_ID, { reliable:true });
-    hostConn = c;
-    c.on('open', () => { netReady = true; starting = false; setStatus('Đã vào phòng. Gửi link mời để rủ thêm bạn bè.'); pushPresence(true); ping(); });
-    c.on('data', m => {
-      if (!m || typeof m !== 'object') return;
-      if (m.t === 'state') applyState(m);
-      else if (m.t === 'pos') applyPos(m.u);
-      else if (m.t === 'pong' && Number.isFinite(m.c) && Number.isFinite(m.h)){ const rtt = Date.now() - m.c; serverOffset = m.h + rtt/2 - Date.now(); }
-    });
-    c.on('close', hostLost);
-    c.on('error', hostLost);
+  let ok = false;
+  const c = mqtt.connect(url, {
+    clientId:'phk_' + uid + '_' + rid().slice(0,4), clean:true, keepalive:20, reconnectPeriod:3000, connectTimeout:8000,
+    will:{ topic:BASE+'pres/'+uid, payload:'bye', qos:0, retain:false }
   });
-  p.on('error', e => {
-    if (e.type === 'peer-unavailable'){ try{ p.destroy(); }catch(_){} hostLost(); }   // chủ phòng đã rời: thử làm chủ phòng
-    else if (!netReady) netFail(e);
+  client = c;
+  c.on('connect', () => {
+    ok = true; netReady = true; if (!joinedAt) joinedAt = Date.now();
+    c.subscribe([BASE+'state', BASE+'pres/+', BASE+'voice'], { qos:0 });
+    setStatus('Đã vào phòng. Gửi link mời để rủ bạn bè.' + (brokerIdx ? ' (máy chủ dự phòng)' : ''));
+    pushPresence(true);
   });
+  c.on('message', (topic, payload) => {
+    const sub = topic.slice(BASE.length);
+    if (sub === 'voice'){ try{ playVoice(unb64(new TextDecoder().decode(payload))); }catch(e){} }
+    else if (sub === 'state'){ let st; try{ st = JSON.parse(new TextDecoder().decode(payload)); }catch(e){ return; } if (st && st.by !== uid) applyState(st); }
+    else if (sub.startsWith('pres/')) onPresence(sub.slice(5), new TextDecoder().decode(payload));
+  });
+  c.on('close', () => { if (netReady) setStatus('Mất kết nối, đang thử lại…'); netReady = false; });
+  setTimeout(() => {
+    if (ok || client !== c) return;
+    try{ c.end(true); }catch(_){}
+    if (brokerIdx + 1 < BROKERS.length){ brokerIdx++; connect(); }
+    else setStatus('Không kết nối được máy chủ phòng. Kiểm tra mạng rồi tải lại trang.');
+  }, 10000);
 }
-function ping(){ if (!isHost && hostConn && hostConn.open){ try{ hostConn.send({ t:'ping', c:Date.now() }); }catch(_){} } }
-setInterval(ping, 5000);
-function hostLost(){
-  if (starting) return; starting = true;
-  const seed = { queue, now };
-  netReady = false; hostConn = null;
-  try{ if (peer) peer.destroy(); }catch(_){}
-  peer = null; inCalls.forEach(e => { try{ e.call.close(); }catch(_){} }); inCalls.clear();
-  setStatus('Chủ phòng đã rời. Đang mở lại phòng…');
-  setTimeout(() => becomeHost(seed), 400 + Math.random()*1600);
-}
-function connect(){ starting = true; becomeHost(null); }
+window.addEventListener('pagehide', () => { try{ if (client){ client.publish(BASE+'pres/'+uid, 'bye'); if (holding) releaseMic(); } }catch(_){} });
 
 /* ----- trình phát YouTube (màn hình lớn có tiếng, màn hình nhắc lời tắt tiếng) ----- */
 async function initPlayers(){
@@ -875,7 +842,7 @@ function doJoin(){
   me.name = clean($('#nameIn').value,24) || 'Khách';
   LS.set('kara.name', me.name); LS.set('kara.color', me.color);
   $('#joinModal').classList.remove('on'); joined = true; updateLookUI();
-  ensureSelfAvatar();
+  ensureAudio(); ensureSelfAvatar();
   renderPeople(); connect(); initPlayers();
 }
 $('#joinBtn').onclick = doJoin;
