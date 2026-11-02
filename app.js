@@ -724,14 +724,30 @@ function applyMonitor(){
     monGain.gain.value = voiceVol;
   }catch(e){}
 }
-$('#monitor').onchange = () => { applyMonitor(); if ($('#monitor').checked && !holding) toast('Cầm mic (F) ở cây mic trên sân khấu để nghe giọng mình.'); };
+$('#monitor').onchange = async () => {
+  ensureAudio();
+  if ($('#monitor').checked && holding && !localStream){            // chế độ Discord: mở micro chỉ để tự nghe
+    const st = await openMonitorMic();
+    if (st && holding && !localStream) localStream = st; else stopStream(st);
+  }
+  applyMonitor();
+  if ($('#monitor').checked && !holding) toast('Cầm mic (F) ở cây mic trên sân khấu để nghe giọng mình.');
+  if ($('#monitor').checked && voiceMode === 'discord') toast('Bạn nghe giọng mình ngay trên máy này. Người khác vẫn nghe bạn qua Discord.');
+};
 const present = id => id === uid || users.has(id);
+async function openMonitorMic(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){ toast('Trình duyệt này không mở được micro.'); return null; }
+  try{ return await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:false, autoGainControl:true } }); }
+  catch(e){ toast('Chưa mở được micro để nghe giọng mình. Bấm biểu tượng ổ khoá cạnh địa chỉ trang và cho phép Micro.'); return null; }
+}
 async function grabMic(){
   if (!netReady){ toast('Chưa kết nối phòng, đợi vài giây rồi thử lại.'); return; }
   if (holding || pendingMic) return;
   if (mic && mic.uid !== uid && present(mic.uid)){ toast(mic.name+' đang cầm mic.'); return; }
   if (voiceMode === 'discord'){
-    pendingMic = true; net.send({ t:'mic', on:true });
+    let st = true;
+    if ($('#monitor').checked){ ensureAudio(); st = await openMonitorMic() || true; }
+    pendingMic = st; net.send({ t:'mic', on:true });
     clearTimeout(pendingT); pendingT = setTimeout(() => { if (pendingMic){ pendingMic = null; toast('Chưa cầm được mic, thử lại nhé.'); } }, 5000);
     checkMic(); return;
   }
@@ -917,7 +933,6 @@ function renderVoiceBox(){
   $('#discordRow').style.display = voiceMode === 'discord' ? '' : 'none';
   if (document.activeElement !== $('#discordUrl')) $('#discordUrl').value = discordUrl;
   const j = $('#discordJoin'); j.style.display = voiceMode === 'discord' && discordUrl ? '' : 'none'; if (discordUrl) j.href = discordUrl;
-  $('#monitorRow').style.display = voiceMode === 'game' ? '' : 'none';
   $('#musicDelay').value = musicDelay; $('#delayVal').textContent = musicDelay;
 }
 $('#vmGame').onclick = () => { if (voiceMode !== 'game') net.send({ t:'voice', mode:'game' }); };
